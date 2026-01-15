@@ -18,29 +18,23 @@ st.markdown("只需要输入你的 ModelScope API Key，即可使用 Tongyi-MAI 
 # --- 2. 侧边栏：用户输入 Key ---
 with st.sidebar:
     st.header("🔑 身份验证")
-    
-    # 获取用户输入的 Key
     user_api_key = st.text_input(
         "请输入 ModelScope API Key",
-        type="password",  # 设置为密码模式，隐藏明文
+        type="password",
         help="你的 Key 不会被存储，仅用于本次请求转发。"
     )
-    
     st.markdown("[👉 点击这里获取免费 API Key](https://modelscope.cn/my/myaccesstoken)")
-    st.info("提示：新用户注册魔搭社区通常有免费额度。")
 
-# --- 3. 定义生成函数 (接收动态 Key) ---
+# --- 3. 定义生成函数 (带智能重试机制) ---
 def generate_image(prompt, api_key):
     base_url = 'https://api-inference.modelscope.cn/'
-    
-    # 关键点：这里使用的是用户传进来的 api_key
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "X-ModelScope-Async-Mode": "true"
     }
 
-    # 发送请求
+    # === 第一步：提交任务 ===
     try:
         response = requests.post(
             f"{base_url}v1/images/generations",
@@ -52,21 +46,32 @@ def generate_image(prompt, api_key):
         )
         response.raise_for_status()
         task_id = response.json()["task_id"]
-        time.sleep(3)  #
+        # print(f"任务已提交，ID: {task_id}") # 调试用
     except Exception as e:
-        return None, f"任务提交失败 (请检查Key是否正确): {str(e)}"
+        return None, f"任务提交失败: {str(e)}"
 
-    # 轮询状态
+    # === 第二步：轮询结果 (智能重试) ===
+    # 这里的逻辑改成了：就算服务器报错说找不到任务，我们也不放弃，而是等一下再问
     start_time = time.time()
+    
     while True:
+        # 1. 超时检查 (60秒)
         if time.time() - start_time > 60:
-            return None, "生成超时"
+            return None, "生成超时，请稍后再试"
 
         try:
+            # 查询状态
             task_resp = requests.get(
                 f"{base_url}v1/tasks/{task_id}",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                headers=headers
             )
+            
+            # 【关键修改】：如果服务器返回 500 或 404 (通常是 Task not found)，我们不报错，而是忽略并重试
+            if task_resp.status_code in [404, 500]:
+                time.sleep(2)
+                continue
+                
+            task_resp.raise_for_status() # 其他错误才抛出异常
             task_data = task_resp.json()
             status = task_data["task_status"]
 
@@ -74,34 +79,29 @@ def generate_image(prompt, api_key):
                 image_url = task_data["output_images"][0]
                 return Image.open(BytesIO(requests.get(image_url).content)), None
             elif status == "FAILED":
-                return None, "生成失败: " + str(task_data)
+                return None, f"生成失败: {task_data}"
             
-            time.sleep(2)
+            # 如果状态是 PENDING 或 RUNNING，继续等待
+            time.sleep(1)
+            
         except Exception as e:
-            return None, f"查询出错: {str(e)}"
+            # 如果是网络波动，也不崩溃，等待重试
+            time.sleep(1)
 
 # --- 4. 主界面逻辑 ---
-prompt_text = st.text_area("想要生成什么画面？(推荐使用英文)", value="A cyberpunk city under the rain, neon lights", height=100)
-
+prompt_text = st.text_area("想要生成什么画面？(推荐使用英文)", value="A cute rabbit in the forest", height=100)
 generate_btn = st.button("🚀 开始生成", type="primary", use_container_width=True)
 
 if generate_btn:
-    # 检查 1: 用户有没有填 Key
     if not user_api_key:
-        st.error("⛔️ 请先在左侧侧边栏输入你的 API Key 才能运行！")
-        st.stop() # 停止往下执行
+        st.error("⛔️ 请先在左侧侧边栏输入你的 API Key！")
+        st.stop()
     
-    # 检查 2: Key 的格式简单验证 (ModelScope Key 通常以 ms- 开头)
-    if not user_api_key.startswith("ms-"):
-        st.warning("⚠️ 这个 Key 看起来格式不对，通常是以 'ms-' 开头的。")
-
-    # 检查 3: 有没有填提示词
     if not prompt_text:
         st.warning("请输入提示词。")
         st.stop()
 
-    # 一切就绪，开始运行
-    with st.spinner("正在连接 ModelScope 云端生成中..."):
+    with st.spinner("正在连接云端生成中... (大约需要 5-10 秒)"):
         image, error = generate_image(prompt_text, user_api_key)
         
         if error:
@@ -110,8 +110,6 @@ if generate_btn:
             st.success("生成成功！")
             st.image(image, caption=prompt_text, use_container_width=True)
             
-            # 下载按钮
             buf = BytesIO()
             image.save(buf, format="PNG")
-
             st.download_button("📥 下载图片", data=buf.getvalue(), file_name="ai_art.png", mime="image/png")
