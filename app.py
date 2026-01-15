@@ -5,27 +5,18 @@ import json
 from PIL import Image
 from io import BytesIO
 
-# --- 1. 页面基础配置 ---
-st.set_page_config(
-    page_title="AI 绘图 (BYOK版)", 
-    page_icon="🎨",
-    layout="centered"
-)
-
+# --- 1. 页面配置 ---
+st.set_page_config(page_title="AI 绘图 (BYOK版)", page_icon="🎨")
 st.title("🎨 AI 绘图生成器")
-st.markdown("只需要输入你的 ModelScope API Key，即可使用 Tongyi-MAI 模型生成图片。")
+st.markdown("输入 API Key，立刻生成图片。")
 
-# --- 2. 侧边栏：用户输入 Key ---
+# --- 2. 侧边栏 ---
 with st.sidebar:
     st.header("🔑 身份验证")
-    user_api_key = st.text_input(
-        "请输入 ModelScope API Key",
-        type="password",
-        help="你的 Key 不会被存储，仅用于本次请求转发。"
-    )
-    st.markdown("[👉 点击这里获取免费 API Key](https://modelscope.cn/my/myaccesstoken)")
+    user_api_key = st.text_input("请输入 ModelScope API Key", type="password")
+    st.markdown("[👉 获取免费 Key](https://modelscope.cn/my/myaccesstoken)")
 
-# --- 3. 定义生成函数 (带智能重试机制) ---
+# --- 3. 核心生成逻辑 (带“死缠烂打”重试机制) ---
 def generate_image(prompt, api_key):
     base_url = 'https://api-inference.modelscope.cn/'
     headers = {
@@ -34,7 +25,7 @@ def generate_image(prompt, api_key):
         "X-ModelScope-Async-Mode": "true"
     }
 
-    # === 第一步：提交任务 ===
+    # === Step 1: 提交任务 ===
     try:
         response = requests.post(
             f"{base_url}v1/images/generations",
@@ -46,70 +37,69 @@ def generate_image(prompt, api_key):
         )
         response.raise_for_status()
         task_id = response.json()["task_id"]
-        # print(f"任务已提交，ID: {task_id}") # 调试用
     except Exception as e:
-        return None, f"任务提交失败: {str(e)}"
+        return None, f"提交任务失败: {str(e)}"
 
-    # === 第二步：轮询结果 (智能重试) ===
-    # 这里的逻辑改成了：就算服务器报错说找不到任务，我们也不放弃，而是等一下再问
+    # === Step 2: 轮询结果 (专门修复 task not found) ===
     start_time = time.time()
     
+    # 强制等待 2 秒，给服务器一点喘息时间
+    time.sleep(2)
+
     while True:
-        # 1. 超时检查 (60秒)
+        # 1. 超时保护 (60秒)
         if time.time() - start_time > 60:
-            return None, "生成超时，请稍后再试"
+            return None, "等待超时，请重试。"
 
         try:
-            # 查询状态
             task_resp = requests.get(
                 f"{base_url}v1/tasks/{task_id}",
                 headers=headers
             )
             
-            # 【关键修改】：如果服务器返回 500 或 404 (通常是 Task not found)，我们不报错，而是忽略并重试
-            if task_resp.status_code in [404, 500]:
+            # 如果 HTTP 层面报错（比如 404/500），直接重试，不报错
+            if task_resp.status_code >= 400:
                 time.sleep(2)
                 continue
-                
-            task_resp.raise_for_status() # 其他错误才抛出异常
+
             task_data = task_resp.json()
-            status = task_data["task_status"]
+            status = task_data.get("task_status")
 
             if status == "SUCCEED":
                 image_url = task_data["output_images"][0]
                 return Image.open(BytesIO(requests.get(image_url).content)), None
+            
             elif status == "FAILED":
+                # 【核心修复点】
+                # 如果失败原因是 "task not found"，这不算真失败，这是服务器延迟。
+                # 我们选择忽略它，继续重试！
+                if "task not found" in str(task_data):
+                    time.sleep(2)
+                    continue  # <--- 关键：跳回循环开头，再问一次
+                
+                # 如果是其他真失败，才报错
                 return None, f"生成失败: {task_data}"
             
-            # 如果状态是 PENDING 或 RUNNING，继续等待
+            # 如果状态是 PENDING 或 RUNNING，继续等
             time.sleep(1)
             
         except Exception as e:
-            # 如果是网络波动，也不崩溃，等待重试
+            # 网络波动也重试
             time.sleep(1)
 
-# --- 4. 主界面逻辑 ---
-prompt_text = st.text_area("想要生成什么画面？(推荐使用英文)", value="A cute rabbit in the forest", height=100)
-generate_btn = st.button("🚀 开始生成", type="primary", use_container_width=True)
+# --- 4. 界面交互 ---
+prompt_text = st.text_area("提示词 (Prompt):", value="A cute cat", height=100)
+run_btn = st.button("🚀 开始生成", type="primary")
 
-if generate_btn:
+if run_btn:
     if not user_api_key:
-        st.error("⛔️ 请先在左侧侧边栏输入你的 API Key！")
+        st.error("请先在左侧填入 API Key")
         st.stop()
-    
-    if not prompt_text:
-        st.warning("请输入提示词。")
-        st.stop()
-
-    with st.spinner("正在连接云端生成中... (大约需要 5-10 秒)"):
-        image, error = generate_image(prompt_text, user_api_key)
         
-        if error:
-            st.error(error)
+    with st.spinner("正在生成中...如果出现波动会自动重试..."):
+        img, err = generate_image(prompt_text, user_api_key)
+        if err:
+            st.error(err)
         else:
-            st.success("生成成功！")
-            st.image(image, caption=prompt_text, use_container_width=True)
-            
-            buf = BytesIO()
-            image.save(buf, format="PNG")
-            st.download_button("📥 下载图片", data=buf.getvalue(), file_name="ai_art.png", mime="image/png")
+            st.success("成功！")
+            st.image(img)
