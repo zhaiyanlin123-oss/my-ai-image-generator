@@ -1,12 +1,13 @@
 import streamlit as st
 import requests
+import time
+import json
 from PIL import Image
 from io import BytesIO
-import json
 
 # --- 1. 页面配置 ---
 st.set_page_config(
-    page_title="AI 绘图 (直连版)", 
+    page_title="AI 绘图 Pro", 
     page_icon="🎨",
     layout="wide"
 )
@@ -14,21 +15,18 @@ st.set_page_config(
 if 'api_key' not in st.session_state:
     st.session_state.api_key = ''
 
-st.title("🎨 AI 绘图生成器 (Turbo直连版)")
+st.title("🎨 AI 绘图生成器 Pro (强力重试版)")
 
 # --- 2. 侧边栏 ---
 with st.sidebar:
     st.header("⚙️ 设置")
     
-    # API Key 输入
     input_key = st.text_input("输入 ModelScope Key", type="password", value=st.session_state.api_key)
     if st.button("✅ 确认保存 Key"):
         if input_key:
-            st.session_state.api_key = input_key.strip() # 去除可能多余的空格
+            st.session_state.api_key = input_key.strip()
             st.success("Key 已保存！")
-        else:
-            st.error("Key 不能为空")
-            
+    
     if st.session_state.api_key:
         st.caption("🟢 状态: 就绪")
     else:
@@ -36,7 +34,6 @@ with st.sidebar:
         
     st.markdown("---")
     
-    # 尺寸选择
     size_option = st.selectbox(
         "画幅比例",
         options=["正方形 (1024x1024)", "横屏 (1280x720)", "竖屏 (720x1280)"],
@@ -50,60 +47,107 @@ with st.sidebar:
     else:
         w, h = 720, 1280
 
-# --- 3. 核心生成逻辑 (同步模式 - 不用排队) ---
-def generate_image_sync(prompt, api_key, width, height):
-    # 严格按照你提供的文档 Base URL
-    url = "https://api-inference.modelscope.cn/v1/images/generations"
+# --- 3. 核心生成逻辑 (异步 + 强力重试) ---
+def generate_image_async(prompt, api_key, width, height):
+    base_url = 'https://api-inference.modelscope.cn/v1'
     
+    # 基础 Header
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
-        # 注意：这里删除了 Async-Mode 和 Task-Type，强制使用同步模式
     }
 
-    # 构造标准 OpenAI 格式的请求体
-    payload = {
-        "model": "Tongyi-MAI/Z-Image-Turbo", # 你的模型ID
-        "prompt": prompt,
-        "n": 1,
-        "size": f"{width}x{height}" # 尝试使用标准 OpenAI size 格式
-        # ModelScope 有时候也兼容 parameters: {"width": w, "height": h}
-        # 如果 size 报错，我们会自动回退到 parameters 写法
-    }
-
+    # === Step 1: 提交任务 (必须异步) ===
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60) # 设置60秒超时
+        # 强制开启异步模式
+        submit_headers = {**headers, "X-ModelScope-Async-Mode": "true"}
         
-        # 调试：如果在本地运行，可以打印 response.text 看看报错
-        # print(response.text) 
+        payload = {
+            "model": "Tongyi-MAI/Z-Image-Turbo",
+            "prompt": prompt,
+            "parameters": {
+                "width": width,
+                "height": height
+            }
+        }
         
+        response = requests.post(
+            f"{base_url}/images/generations",
+            headers=submit_headers,
+            data=json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        )
         response.raise_for_status()
+        task_id = response.json()["task_id"]
+        # print(f"任务提交成功: {task_id}") # 调试用
         
-        # 解析 OpenAI 格式的返回结果
-        # 成功格式: {"created": ..., "data": [{"url": "..."}]}
-        result = response.json()
-        
-        if "data" in result and len(result["data"]) > 0:
-            image_url = result["data"][0]["url"]
-            return Image.open(BytesIO(requests.get(image_url).content)), None
-        else:
-            return None, f"服务器返回格式异常: {result}"
-
-    except requests.exceptions.HTTPError as e:
-        # 尝试读取服务器返回的具体错误信息
-        try:
-            error_msg = response.json()
-            return None, f"服务器报错: {error_msg}"
-        except:
-            return None, f"请求失败 (代码 {response.status_code}): {str(e)}"
     except Exception as e:
-        return None, f"发生错误: {str(e)}"
+        return None, f"提交任务失败: {str(e)}"
+
+    # === Step 2: 轮询结果 (专门解决 task not found) ===
+    start_time = time.time()
+    time.sleep(2) # 初始缓冲
+
+    # 循环查询
+    while True:
+        # 超时保护 (60秒)
+        if time.time() - start_time > 60:
+            return None, "生成超时，请重试。"
+
+        try:
+            # 查询任务状态
+            # 关键：带上 Task-Type 帮助服务器定位
+            query_headers = {**headers, "X-ModelScope-Task-Type": "image_generation"}
+            
+            task_resp = requests.get(
+                f"{base_url}/tasks/{task_id}",
+                headers=query_headers
+            )
+            
+            # 1. 处理 HTTP 层面错误 (404/500)
+            if task_resp.status_code >= 400:
+                # print(f"HTTP等待: {task_resp.status_code}") 
+                time.sleep(1.5)
+                continue
+
+            # 2. 解析 JSON
+            task_data = task_resp.json()
+            status = task_data.get("task_status")
+
+            # 3. 判断状态
+            if status == "SUCCEED":
+                # 成功！获取图片
+                if "output_images" in task_data and task_data["output_images"]:
+                    image_url = task_data["output_images"][0]
+                    return Image.open(BytesIO(requests.get(image_url).content)), None
+                else:
+                    # 有时候成功了但没有 output_images，可能是 results
+                    # print(task_data)
+                    return None, f"数据解析异常: {task_data}"
+            
+            elif status == "FAILED":
+                # === 核心修复逻辑 ===
+                # 如果服务器说 FAILED，但原因是 "task not found"，这不算失败！
+                error_msg = str(task_data)
+                if "task not found" in error_msg or "500" in error_msg:
+                    # print("服务器还没同步到任务，继续等待...")
+                    time.sleep(1.5)
+                    continue # 跳过报错，继续循环！
+                
+                # 如果是其他真正的错误，才报错
+                return None, f"生成失败: {task_data}"
+            
+            # PENDING / RUNNING
+            time.sleep(1)
+            
+        except Exception as e:
+            # 网络波动，继续重试
+            time.sleep(1)
 
 # --- 4. 界面布局 ---
 col1, col2 = st.columns([3, 1])
 
 with col1:
-    prompt_text = st.text_area("✨ 提示词 (英文效果最佳)", value="A cute cat, 3d render", height=120)
+    prompt_text = st.text_area("✨ 提示词 (Prompt)", value="A cute cat, 3d render", height=120)
 
 with col2:
     st.write(" ")
@@ -118,15 +162,14 @@ if run_btn:
         st.error("⚠️ 请先在左侧输入并保存 API Key")
         st.stop()
         
-    with st.spinner("⚡️ 正在极速生成中 (约 5-10 秒)..."):
-        # 调用新的同步函数
-        img, err = generate_image_sync(prompt_text, final_key, w, h)
+    with st.spinner("⚡️ 正在生成... (如遇波动会自动重试)"):
+        img, err = generate_image_async(prompt_text, final_key, w, h)
         
         if err:
             st.error(err)
-            # 如果报错关于 size 参数，可能需要改回 parameters 写法，但通常 v1 接口支持 size
         else:
-            st.success(f"✨ 生成成功!")
+            st.balloons()
+            st.success("✨ 生成成功!")
             st.image(img, caption=prompt_text, use_container_width=True)
             
             buf = BytesIO()
