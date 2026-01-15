@@ -7,35 +7,30 @@ from io import BytesIO
 
 # --- 1. 页面配置 ---
 st.set_page_config(
-    page_title="AI 绘图 Pro", 
-    page_icon="🎨",
+    page_title="AI 绘图 (终极版)", 
+    page_icon="🛠️",
     layout="wide"
 )
 
 if 'api_key' not in st.session_state:
     st.session_state.api_key = ''
 
-st.title("🎨 AI 绘图生成器 Pro (强力重试版)")
+st.title("🛠️ AI 绘图生成器 (自动重投版)")
+st.markdown("针对“Task not found”错误的终极解决方案：**查不到就重发，直到成功。**")
 
 # --- 2. 侧边栏 ---
 with st.sidebar:
     st.header("⚙️ 设置")
     
-    input_key = st.text_input("输入 ModelScope Key", type="password", value=st.session_state.api_key)
+    input_key = st.text_input("ModelScope Key", type="password", value=st.session_state.api_key)
     if st.button("✅ 确认保存 Key"):
         if input_key:
             st.session_state.api_key = input_key.strip()
-            st.success("Key 已保存！")
+            st.success("已保存")
     
-    if st.session_state.api_key:
-        st.caption("🟢 状态: 就绪")
-    else:
-        st.caption("🔴 状态: 未配置")
-        
-    st.markdown("---")
-    
+    # 尺寸选择
     size_option = st.selectbox(
-        "画幅比例",
+        "画幅",
         options=["正方形 (1024x1024)", "横屏 (1280x720)", "竖屏 (720x1280)"],
         index=0
     )
@@ -47,131 +42,143 @@ with st.sidebar:
     else:
         w, h = 720, 1280
 
-# --- 3. 核心生成逻辑 (异步 + 强力重试) ---
-def generate_image_async(prompt, api_key, width, height):
+    st.divider()
+    show_debug = st.checkbox("显示调试日志 (Debug)", value=True)
+
+# --- 3. 核心逻辑：带“弃单重投”机制 ---
+def log(msg):
+    if show_debug:
+        st.code(msg, language="text")
+
+def generate_with_retry(prompt, api_key, width, height):
     base_url = 'https://api-inference.modelscope.cn/v1'
-    
-    # 基础 Header
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-ModelScope-Async-Mode": "true" # 必须异步
     }
-
-    # === Step 1: 提交任务 (必须异步) ===
-    try:
-        # 强制开启异步模式
-        submit_headers = {**headers, "X-ModelScope-Async-Mode": "true"}
+    
+    # === 外层循环：尝试提交任务（最多重试 3 次）===
+    max_submission_retries = 3
+    
+    for attempt in range(max_submission_retries):
+        log(f"🔄 [第 {attempt + 1} 次尝试] 正在提交新任务...")
         
-        payload = {
-            "model": "Tongyi-MAI/Z-Image-Turbo",
-            "prompt": prompt,
-            "parameters": {
-                "width": width,
-                "height": height
-            }
-        }
-        
-        response = requests.post(
-            f"{base_url}/images/generations",
-            headers=submit_headers,
-            data=json.dumps(payload, ensure_ascii=False).encode('utf-8')
-        )
-        response.raise_for_status()
-        task_id = response.json()["task_id"]
-        # print(f"任务提交成功: {task_id}") # 调试用
-        
-    except Exception as e:
-        return None, f"提交任务失败: {str(e)}"
-
-    # === Step 2: 轮询结果 (专门解决 task not found) ===
-    start_time = time.time()
-    time.sleep(2) # 初始缓冲
-
-    # 循环查询
-    while True:
-        # 超时保护 (60秒)
-        if time.time() - start_time > 60:
-            return None, "生成超时，请重试。"
-
         try:
-            # 查询任务状态
-            # 关键：带上 Task-Type 帮助服务器定位
-            query_headers = {**headers, "X-ModelScope-Task-Type": "image_generation"}
+            # 1. 提交任务
+            payload = {
+                "model": "Tongyi-MAI/Z-Image-Turbo",
+                "prompt": prompt,
+                "parameters": {"width": width, "height": height}
+            }
             
-            task_resp = requests.get(
-                f"{base_url}/tasks/{task_id}",
-                headers=query_headers
+            resp = requests.post(
+                f"{base_url}/images/generations",
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=10
             )
-            
-            # 1. 处理 HTTP 层面错误 (404/500)
-            if task_resp.status_code >= 400:
-                # print(f"HTTP等待: {task_resp.status_code}") 
-                time.sleep(1.5)
-                continue
-
-            # 2. 解析 JSON
-            task_data = task_resp.json()
-            status = task_data.get("task_status")
-
-            # 3. 判断状态
-            if status == "SUCCEED":
-                # 成功！获取图片
-                if "output_images" in task_data and task_data["output_images"]:
-                    image_url = task_data["output_images"][0]
-                    return Image.open(BytesIO(requests.get(image_url).content)), None
-                else:
-                    # 有时候成功了但没有 output_images，可能是 results
-                    # print(task_data)
-                    return None, f"数据解析异常: {task_data}"
-            
-            elif status == "FAILED":
-                # === 核心修复逻辑 ===
-                # 如果服务器说 FAILED，但原因是 "task not found"，这不算失败！
-                error_msg = str(task_data)
-                if "task not found" in error_msg or "500" in error_msg:
-                    # print("服务器还没同步到任务，继续等待...")
-                    time.sleep(1.5)
-                    continue # 跳过报错，继续循环！
-                
-                # 如果是其他真正的错误，才报错
-                return None, f"生成失败: {task_data}"
-            
-            # PENDING / RUNNING
-            time.sleep(1)
+            resp.raise_for_status()
+            task_id = resp.json()["task_id"]
+            log(f"✅ 任务提交成功，ID: {task_id}")
             
         except Exception as e:
-            # 网络波动，继续重试
-            time.sleep(1)
+            log(f"❌ 提交阶段报错: {e}")
+            time.sleep(2)
+            continue # 提交都失败了，直接下一次循环
+            
+        # 2. 轮询查结果 (如果 10 秒内一直 task not found，就跳出，重新提交)
+        poll_start = time.time()
+        not_found_count = 0
+        
+        while True:
+            # 如果轮询超过 25 秒还没结果，认为这个 ID 废了，强制重开
+            if time.time() - poll_start > 25:
+                log("⚠️ 单次轮询超时，放弃此 ID，准备重新提交...")
+                break 
+            
+            try:
+                # 查询状态
+                # 技巧：尝试去掉 Task-Type header，有时候反而能查到
+                check_resp = requests.get(
+                    f"{base_url}/tasks/{task_id}",
+                    headers={"Authorization": f"Bearer {api_key}"}, # 简化 Header 试试
+                    timeout=10
+                )
+                
+                # 处理 500/404 Task not found
+                if check_resp.status_code >= 400:
+                    not_found_count += 1
+                    log(f"⏳ 服务器暂未找到任务 ({check_resp.status_code}) - {not_found_count}次")
+                    
+                    # 如果连续 5 次都找不到，说明这个 ID 是死 ID
+                    if not_found_count > 5:
+                        log("🚫 连续多次找不到任务，判定为死任务。")
+                        break # 跳出内层 while，触发外层 for 重新提交
+                        
+                    time.sleep(2)
+                    continue
+
+                data = check_resp.json()
+                status = data.get("task_status")
+                
+                if status == "SUCCEED":
+                    log("🎉 任务成功！正在下载图片...")
+                    img_url = data["output_images"][0]
+                    return Image.open(BytesIO(requests.get(img_url).content)), None
+                
+                elif status == "FAILED":
+                    # 再次检查是不是假失败
+                    if "task not found" in str(data):
+                        not_found_count += 1
+                        log(f"🕵️ 伪装的失败 (Task not found) - 继续等待")
+                        time.sleep(2)
+                        continue
+                    else:
+                        return None, f"生成失败: {data}"
+                
+                else:
+                    log(f"🚀 状态: {status}...")
+                    time.sleep(2)
+                    
+            except Exception as e:
+                log(f"⚠️ 网络波动: {e}")
+                time.sleep(2)
+        
+        # 如果代码跑到这里，说明 break 了 inner loop，准备进入下一次 attempt
+        log("🔁 正在重新尝试新的任务提交...")
+        time.sleep(2)
+
+    return None, "❌ 已尝试 3 次重新提交，但服务器依然无响应。请检查 API Key 余额或稍后再试。"
 
 # --- 4. 界面布局 ---
 col1, col2 = st.columns([3, 1])
-
 with col1:
-    prompt_text = st.text_area("✨ 提示词 (Prompt)", value="A cute cat, 3d render", height=120)
-
+    prompt_text = st.text_area("提示词", value="A cute cat, high quality", height=100)
 with col2:
     st.write(" ")
     st.write(" ")
-    run_btn = st.button("🚀 开始生成", type="primary", use_container_width=True)
+    run_btn = st.button("🚀 强力生成", type="primary", use_container_width=True)
 
 st.divider()
 
 if run_btn:
-    final_key = st.session_state.api_key
-    if not final_key:
-        st.error("⚠️ 请先在左侧输入并保存 API Key")
+    key = st.session_state.api_key
+    if not key:
+        st.error("请先在左侧保存 API Key")
         st.stop()
+    
+    with st.container():
+        # 这里不显示 spinner，因为我们有自定义 log
+        st.info("正在执行强力生成模式... 请关注下方日志")
+        img, err = generate_with_retry(prompt_text, key, w, h)
         
-    with st.spinner("⚡️ 正在生成... (如遇波动会自动重试)"):
-        img, err = generate_image_async(prompt_text, final_key, w, h)
-        
-        if err:
-            st.error(err)
-        else:
-            st.balloons()
-            st.success("✨ 生成成功!")
-            st.image(img, caption=prompt_text, use_container_width=True)
-            
+        if img:
+            st.success("生成成功！")
+            st.image(img, use_container_width=True)
+            # 下载
             buf = BytesIO()
             img.save(buf, format="PNG")
-            st.download_button("📥 下载图片", data=buf.getvalue(), file_name="ai_image.png", mime="image/png", use_container_width=True)
+            st.download_button("📥 下载原图", data=buf.getvalue(), file_name="final_result.png")
+        else:
+            st.error(err)
