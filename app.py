@@ -52,6 +52,7 @@ def generate_image(prompt, api_key):
         )
         response.raise_for_status()
         task_id = response.json()["task_id"]
+        time.sleep(3)  #
     except Exception as e:
         return None, f"任务提交失败 (请检查Key是否正确): {str(e)}"
 
@@ -112,4 +113,5 @@ if generate_btn:
             # 下载按钮
             buf = BytesIO()
             image.save(buf, format="PNG")
+
             st.download_button("📥 下载图片", data=buf.getvalue(), file_name="ai_art.png", mime="image/png")
