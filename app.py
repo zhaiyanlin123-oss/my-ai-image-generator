@@ -8,7 +8,7 @@ from io import BytesIO
 # --- 1. 页面配置 ---
 st.set_page_config(page_title="AI 绘图 (BYOK版)", page_icon="🎨")
 st.title("🎨 AI 绘图生成器")
-st.markdown("输入 API Key，立刻生成图片。")
+st.caption("基于 ModelScope 通义模型")
 
 # --- 2. 侧边栏 ---
 with st.sidebar:
@@ -16,20 +16,24 @@ with st.sidebar:
     user_api_key = st.text_input("请输入 ModelScope API Key", type="password")
     st.markdown("[👉 获取免费 Key](https://modelscope.cn/my/myaccesstoken)")
 
-# --- 3. 核心生成逻辑 (带“死缠烂打”重试机制) ---
+# --- 3. 核心生成逻辑 ---
 def generate_image(prompt, api_key):
     base_url = 'https://api-inference.modelscope.cn/'
-    headers = {
+    
+    # 基础 Header
+    auth_headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "X-ModelScope-Async-Mode": "true"
+        "Content-Type": "application/json"
     }
 
     # === Step 1: 提交任务 ===
     try:
+        # 发送请求时开启异步模式
+        submit_headers = {**auth_headers, "X-ModelScope-Async-Mode": "true"}
+        
         response = requests.post(
             f"{base_url}v1/images/generations",
-            headers=headers,
+            headers=submit_headers,
             data=json.dumps({
                 "model": "Tongyi-MAI/Z-Image-Turbo",
                 "prompt": prompt
@@ -40,24 +44,25 @@ def generate_image(prompt, api_key):
     except Exception as e:
         return None, f"提交任务失败: {str(e)}"
 
-    # === Step 2: 轮询结果 (专门修复 task not found) ===
+    # === Step 2: 轮询结果 ===
     start_time = time.time()
-    
-    # 强制等待 2 秒，给服务器一点喘息时间
-    time.sleep(2)
+    time.sleep(2) # 给服务器 2 秒缓冲
 
     while True:
-        # 1. 超时保护 (60秒)
-        if time.time() - start_time > 60:
-            return None, "等待超时，请重试。"
+        # 超时时间延长到 90 秒
+        if time.time() - start_time > 90:
+            return None, "生成超时（服务器响应过慢），请稍后再试。"
 
         try:
+            # 【关键修正】：查询时必须带上 Task-Type，否则服务器找不到任务！
+            query_headers = {**auth_headers, "X-ModelScope-Task-Type": "image_generation"}
+            
             task_resp = requests.get(
                 f"{base_url}v1/tasks/{task_id}",
-                headers=headers
+                headers=query_headers
             )
             
-            # 如果 HTTP 层面报错（比如 404/500），直接重试，不报错
+            # 遇到 404/500 依然等待重试
             if task_resp.status_code >= 400:
                 time.sleep(2)
                 continue
@@ -70,25 +75,20 @@ def generate_image(prompt, api_key):
                 return Image.open(BytesIO(requests.get(image_url).content)), None
             
             elif status == "FAILED":
-                # 【核心修复点】
-                # 如果失败原因是 "task not found"，这不算真失败，这是服务器延迟。
-                # 我们选择忽略它，继续重试！
+                # 依然保持防误判逻辑
                 if "task not found" in str(task_data):
                     time.sleep(2)
-                    continue  # <--- 关键：跳回循环开头，再问一次
-                
-                # 如果是其他真失败，才报错
+                    continue
                 return None, f"生成失败: {task_data}"
             
-            # 如果状态是 PENDING 或 RUNNING，继续等
-            time.sleep(1)
+            # PENDING / RUNNING
+            time.sleep(2)
             
         except Exception as e:
-            # 网络波动也重试
-            time.sleep(1)
+            time.sleep(2)
 
 # --- 4. 界面交互 ---
-prompt_text = st.text_area("提示词 (Prompt):", value="A cute cat", height=100)
+prompt_text = st.text_area("提示词 (Prompt):", value="A futuristic cyberpunk city, neon lights, high detail", height=100)
 run_btn = st.button("🚀 开始生成", type="primary")
 
 if run_btn:
@@ -96,7 +96,7 @@ if run_btn:
         st.error("请先在左侧填入 API Key")
         st.stop()
         
-    with st.spinner("正在生成中...如果出现波动会自动重试..."):
+    with st.spinner("正在生成中..."):
         img, err = generate_image(prompt_text, user_api_key)
         if err:
             st.error(err)
